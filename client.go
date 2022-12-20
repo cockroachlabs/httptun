@@ -12,8 +12,11 @@ import (
 	"golang.org/x/sync/semaphore"
 )
 
+// WebsocketDialer is a function that dials a websocket connection, it is to be implemented by the caller and is
+// used in the client.
 type WebsocketDialer func(ctx context.Context) (*websocket.Conn, error)
 
+// Client represents a tunnel client that can be used to dial connections on the server.
 type Client struct {
 	sessionPool *sessionPool
 	dialer      WebsocketDialer
@@ -85,6 +88,11 @@ func (c *Client) Connect(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// Dial forms a tunnel to the backend TCP endpoint and returns a net.Conn.
+func (c *Client) Dial(ctx context.Context) (net.Conn, error) {
+	return c.sessionPool.getSession().Dial(ctx)
 }
 
 type WrappedSession struct {
@@ -166,7 +174,7 @@ func (c *Client) dialSession(dialCtx context.Context, waitForConn bool) (*Wrappe
 					connResultSent = true
 					result <- nil
 				} else {
-					c.logger.Infof("Reconnected successfully")
+					c.logger.Infof("Connected successfully")
 				}
 
 				s.sessionMutex.Release(1)
