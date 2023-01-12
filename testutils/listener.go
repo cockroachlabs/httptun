@@ -3,7 +3,6 @@ package testutils
 import (
 	"bytes"
 	"io"
-	"io/ioutil"
 	"net"
 	"testing"
 	"time"
@@ -76,7 +75,7 @@ func (c *AssertConn) ExpectRead(data []byte) error {
 }
 
 func (c *AssertConn) ExpectClose() error {
-	w, _ := io.Copy(ioutil.Discard, c)
+	w, _ := io.Copy(io.Discard, c)
 	if w != 0 {
 		return errors.Errorf("expected to read 0 bytes, got %d", w)
 	}

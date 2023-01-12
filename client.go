@@ -2,10 +2,13 @@ package httptun
 
 import (
 	"context"
+	"encoding/binary"
 	"net"
 	"sync"
 	"time"
 
+	"github.com/cockroachdb/errors"
+	"github.com/gofrs/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/xtaci/smux"
 	"go.uber.org/zap"
@@ -92,7 +95,104 @@ func (c *Client) Connect(ctx context.Context) error {
 
 // Dial forms a tunnel to the backend TCP endpoint and returns a net.Conn.
 func (c *Client) Dial(ctx context.Context) (net.Conn, error) {
-	return c.sessionPool.getSession().Dial(ctx)
+	connectionResult := make(chan error, 1)
+
+	established := false
+	stream := NewStream(maxBufferSize, minBufferBehindSize, c.logger)
+
+	go func() {
+		c.logger.Debugf("starting dial loop")
+		var streamID uuid.UUID
+
+		for !stream.IsClosed() {
+			var conn net.Conn
+			var err error
+
+			if established {
+				conn, err = c.sessionPool.getSession().Dial(context.Background())
+			} else {
+				conn, err = c.sessionPool.getSession().Dial(ctx)
+			}
+
+			if err != nil {
+				c.logger.Errorw("failed to dial connection", "err", err)
+				time.Sleep(100 * time.Millisecond)
+
+				continue
+			}
+
+			err = func() error {
+				defer conn.Close()
+
+				flow, resumeFrom, err := stream.NewFlow()
+				if err != nil {
+					return errors.WithMessage(err, "create flow")
+				}
+
+				err = binary.Write(conn, binary.LittleEndian, Handshake{
+					ID:         streamID,
+					ResumeFrom: resumeFrom,
+				})
+				if err != nil {
+					return errors.WithMessage(err, "write handshake")
+				}
+
+				var handshake Handshake
+				err = binary.Read(conn, binary.LittleEndian, &handshake)
+				if err != nil {
+					return errors.WithMessage(err, "read handshake")
+				}
+
+				if handshake.ErrorCode != 0 {
+					if handshake.ErrorCode == CodeCannotResume || handshake.ErrorCode == CodeSessionNotFound {
+						// Stream is not resumable with these errors.
+						stream.Close()
+					}
+					return errors.Newf("handshake error code: %d", handshake.ErrorCode)
+				}
+
+				streamID = handshake.ID
+
+				c.logger.Debugf("dial loop established connection")
+				if !established {
+					stream.remoteAddr = conn.RemoteAddr()
+					stream.localAddr = conn.LocalAddr()
+
+					established = true
+					select {
+					case connectionResult <- nil:
+					default:
+					}
+				}
+
+				err = flow.Resume(conn, handshake.ResumeFrom)
+				c.logger.Debugf("connection closed: %+v", err)
+
+				return nil
+			}()
+			if err != nil {
+				c.logger.Errorf("failed to handshake: %+v\n", err)
+
+				if !established {
+					select {
+					case connectionResult <- err:
+					default:
+					}
+				}
+
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+		}
+	}()
+
+	err := <-connectionResult
+	if err != nil {
+		stream.Close()
+		return nil, err
+	}
+
+	return stream, nil
 }
 
 type WrappedSession struct {
@@ -107,6 +207,10 @@ func (s *WrappedSession) Dial(ctx context.Context) (net.Conn, error) {
 		return nil, err
 	}
 	stream, err := s.session.OpenStream()
+	if err != nil {
+		// Close the session if it's no longer valid.
+		s.session.Close()
+	}
 	s.sessionMutex.Release(1)
 
 	return stream, err
@@ -130,7 +234,13 @@ func (c *Client) dialSession(dialCtx context.Context, waitForConn bool) (*Wrappe
 		c.wg.Add(1)
 		defer c.wg.Done()
 
-		defer s.sessionMutex.Release(1)
+		shouldRelease := true
+
+		defer func() {
+			if shouldRelease {
+				s.sessionMutex.Release(1)
+			}
+		}()
 
 		connResultSent := !waitForConn
 		for {
@@ -162,7 +272,7 @@ func (c *Client) dialSession(dialCtx context.Context, waitForConn bool) (*Wrappe
 						return
 					}
 
-					c.logger.Warnf("Failed to create session, retrying in 3 seconds: %v", err)
+					c.logger.Infof("failed to create session, retrying in 3 seconds: %v", err)
 					time.Sleep(time.Second * 3)
 					return
 				}
@@ -174,14 +284,15 @@ func (c *Client) dialSession(dialCtx context.Context, waitForConn bool) (*Wrappe
 					connResultSent = true
 					result <- nil
 				} else {
-					c.logger.Infof("Connected successfully")
+					c.logger.Debugf("connected successfully")
 				}
 
 				s.sessionMutex.Release(1)
+				shouldRelease = false
 
 				select {
 				case <-s.session.CloseChan():
-					c.logger.Infof("Session closed, reconnecting...")
+					c.logger.Debugf("session closed, reconnecting...")
 				case <-c.ctx.Done():
 					shouldExit = true
 				}
@@ -194,6 +305,7 @@ func (c *Client) dialSession(dialCtx context.Context, waitForConn bool) (*Wrappe
 			if err := s.sessionMutex.Acquire(c.ctx, 1); err != nil {
 				return
 			}
+			shouldRelease = true
 		}
 	}()
 

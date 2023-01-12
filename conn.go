@@ -12,7 +12,7 @@ func DefaultSmuxConfig() *smux.Config {
 	return &smux.Config{
 		Version:           1,
 		KeepAliveInterval: 5 * time.Second,
-		KeepAliveTimeout:  15 * time.Second,
+		KeepAliveTimeout:  10 * time.Second,
 		MaxFrameSize:      32768,
 		MaxReceiveBuffer:  4194304,
 		MaxStreamBuffer:   65536,
