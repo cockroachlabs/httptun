@@ -12,21 +12,22 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/require"
+	"github.com/gorilla/websocket"
 	"go.uber.org/zap/zaptest"
 )
 
 func TestTunnel(t *testing.T) {
 	// Set up a network like this:
 	//
-	// upstream   tunnel server   tunnel client   downstream
-	//    TCP <---> TCP....WS <---> WS....TCP <---> TCP
+	// upstream   tunnel server   tunnel client
+	//    TCP <---> TCP....WS <---> WS
 
 	// Start the upstream TCP server.
 	ln := listen(t)
 
 	// Start the tunnel server, which uses ln as its upstream.
-	srv := NewServer(ln.Addr(), zaptest.NewLogger(t).Sugar().Named("server"))
+	srv := NewServer(ln.Addr(), time.Millisecond*200, zaptest.NewLogger(t).Sugar().Named("server"))
+	defer srv.Close()
 	// Make a test HTTP server with the standard library.
 	httpServer := httptest.NewServer(srv)
 	t.Logf("serving http at %s", httpServer.URL)
@@ -35,7 +36,7 @@ func TestTunnel(t *testing.T) {
 	u, err := url.Parse(httpServer.URL)
 	assertNil(t, err)
 	u.Scheme = "ws"
-	client := Client{Addr: u.String()}
+	client := Client{Addr: u.String(), Logger: zaptest.NewLogger(t).Sugar().Named("client")}
 
 	// Establish a connection from the downstream to the upstream.
 	src_one, err := client.Dial(context.Background())
@@ -71,7 +72,7 @@ func TestTunnel(t *testing.T) {
 	src_one.Close()
 	assertClosed(t, dst_one)
 
-	require.Zero(t, ln.UnhandledConns())
+	assertEqual(t, 0, ln.UnhandledConns())
 
 	assertNil(t, ln.Close())
 }
@@ -83,7 +84,7 @@ func assertNil(t *testing.T, got interface{}) {
 	}
 }
 
-func assertEqual(t *testing.T, want, got interface{}) {
+func assertEqual[T comparable](t *testing.T, want, got T) {
 	t.Helper()
 	if want != got {
 		t.Fatalf("want=%v got=%v", want, got)
@@ -190,4 +191,68 @@ func (l *listener) Close() error {
 
 func (l *listener) Addr() string {
 	return l.ln.Addr().String()
+}
+
+func TestConnectionResume(t *testing.T) {
+	// Set up a network like this:
+	//
+	// upstream   tunnel server   tunnel client
+	//    TCP <---> TCP....WS <---> WS
+
+	ln := listen(t)
+
+	server := NewServer(ln.Addr(), time.Millisecond*200, zaptest.NewLogger(t).Sugar().Named("server"))
+	defer server.Close()
+	httpServer := httptest.NewServer(server)
+
+	u, err := url.Parse(httpServer.URL)
+	assertNil(t, err)
+	u.Scheme = "ws"
+
+	var underlyingConn net.Conn
+
+	dialer := &websocket.Dialer{
+		NetDialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			var netDialer net.Dialer
+			var err error
+			underlyingConn, err = netDialer.DialContext(ctx, network, addr)
+			return underlyingConn, err
+		},
+	}
+
+	client := &Client{
+		Dialer: dialer,
+		Addr:   u.String(),
+		Logger: zaptest.NewLogger(t).Sugar().Named("client"),
+	}
+
+	// Establish a connection from the downstream to the upstream.
+	src_one, err := client.Dial(context.Background())
+	assertNil(t, err)
+	// Retrieve the corresponding upstream connection.
+	dst_one, err := ln.NextConn(time.Second)
+	assertNil(t, err)
+
+	// Test both directions of the connection.
+	assertWrite(t, src_one, []byte("ping"))
+	assertRead(t, []byte("ping"), dst_one)
+	assertWrite(t, dst_one, []byte("pong"))
+	assertRead(t, []byte("pong"), src_one)
+
+	// Interrupt the underlying connection
+	underlyingConn.Close()
+
+	// Test both directions of the connection again to make sure that it has resumed.
+	assertWrite(t, src_one, []byte("ping2"))
+	assertRead(t, []byte("ping2"), dst_one)
+	assertWrite(t, dst_one, []byte("pong2"))
+	assertRead(t, []byte("pong2"), src_one)
+
+	// Close one side of the connection.
+	src_one.Close()
+	assertClosed(t, dst_one)
+
+	assertEqual(t, 0, ln.UnhandledConns())
+
+	assertNil(t, ln.Close())
 }
