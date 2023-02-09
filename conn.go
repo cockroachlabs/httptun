@@ -5,19 +5,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/xtaci/smux"
 )
-
-func DefaultSmuxConfig() *smux.Config {
-	return &smux.Config{
-		Version:           1,
-		KeepAliveInterval: 5 * time.Second,
-		KeepAliveTimeout:  15 * time.Second,
-		MaxFrameSize:      32768,
-		MaxReceiveBuffer:  4194304,
-		MaxStreamBuffer:   65536,
-	}
-}
 
 // WebsocketConn wraps *websocket.Conn into implementing net.Conn
 type WebsocketConn struct {
