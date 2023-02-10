@@ -6,7 +6,6 @@ import (
 	"net/http"
 
 	"github.com/gorilla/websocket"
-	"github.com/xtaci/smux"
 	"go.uber.org/zap"
 )
 
@@ -33,39 +32,21 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		panic(err)
 	}
 
-	c := NewWebsocketConn(conn)
+	downstream := NewWebsocketConn(conn)
+	defer downstream.Close()
 
-	session, err := smux.Server(c, DefaultSmuxConfig())
-	if err != nil {
-		panic(err)
-	}
-
-	for {
-		stream, err := session.AcceptStream()
-		if err != nil {
-			return
-		}
-
-		go s.handleStream(stream)
-	}
-}
-
-func (s *Server) handleStream(conn *smux.Stream) {
-	defer conn.Close()
-
-	out, err := net.Dial("tcp", s.dst)
+	upstream, err := net.Dial("tcp", s.dst)
 	if err != nil {
 		s.logger.Warnf("failed to dial %q: %+v", s.dst, err)
 		return
 	}
-
-	defer out.Close()
+	defer upstream.Close()
 
 	go func() {
-		defer conn.Close()
-		defer out.Close()
-		_, _ = io.Copy(conn, out)
+		defer downstream.Close()
+		defer upstream.Close()
+		_, _ = io.Copy(downstream, upstream)
 	}()
 
-	_, _ = io.Copy(out, conn)
+	_, _ = io.Copy(upstream, downstream)
 }
