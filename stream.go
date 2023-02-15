@@ -29,6 +29,7 @@ type Stream struct {
 
 // NewStream creates a new stream.
 func NewStream(maxTotal, minBehind int64, logger *zap.SugaredLogger) *Stream {
+	streamsCount.Inc()
 	return &Stream{
 		writeBuffer:  NewBuffer(maxTotal, minBehind, logger),
 		wg:           new(sync.WaitGroup),
@@ -128,6 +129,7 @@ func (s *Stream) Close() error {
 	s.cond.L.Unlock()
 	s.cond.Broadcast()
 	s.writeBuffer.Close()
+	streamsCount.Dec()
 	return nil
 }
 

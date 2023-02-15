@@ -50,7 +50,7 @@ func (c *Client) dialWebsocket(ctx context.Context) (net.Conn, error) {
 
 // Dial forms a tunnel to the backend TCP endpoint and returns a net.Conn.
 //
-// Callers are responible for closing the returned connection.
+// Callers are responsible for closing the returned connection.
 func (c *Client) Dial(ctx context.Context) (net.Conn, error) {
 	connectionResult := make(chan error, 1)
 
