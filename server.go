@@ -23,6 +23,8 @@ const (
 	defaultByteBufferSize = 65535
 )
 
+// Server is a server that can be used to serve HTTP requests over a websocket connection.
+// It overrides the default http.Server to use a websocket connection instead of a plain TCP connection.
 type Server struct {
 	dst      string
 	upgrader *websocket.Upgrader
@@ -38,6 +40,7 @@ type Server struct {
 // ErrorCode represents an error code in a handshake.
 type ErrorCode int64
 
+// List of error codes.
 const (
 	CodeNoError = ErrorCode(iota)
 	CodeSessionNotFound
