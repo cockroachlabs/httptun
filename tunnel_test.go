@@ -39,38 +39,38 @@ func TestTunnel(t *testing.T) {
 	client := Client{Addr: u.String(), Logger: zaptest.NewLogger(t).Sugar().Named("client")}
 
 	// Establish a connection from the downstream to the upstream.
-	src_one, err := client.Dial(context.Background())
+	srcOne, err := client.Dial(context.Background())
 	assertNil(t, err)
 	// Retrieve the corresponding upstream connection.
-	dst_one, err := ln.NextConn(time.Second)
+	dstOne, err := ln.NextConn(time.Second)
 	assertNil(t, err)
 
 	// Test both directions of the connection.
-	assertWrite(t, src_one, []byte("ping"))
-	assertRead(t, []byte("ping"), dst_one)
-	assertWrite(t, dst_one, []byte("pong"))
-	assertRead(t, []byte("pong"), src_one)
+	assertWrite(t, srcOne, []byte("ping"))
+	assertRead(t, []byte("ping"), dstOne)
+	assertWrite(t, dstOne, []byte("pong"))
+	assertRead(t, []byte("pong"), srcOne)
 
 	// Establish another connection.
-	src_two, err := client.Dial(context.Background())
+	srcTwo, err := client.Dial(context.Background())
 	assertNil(t, err)
-	dst_two, err := ln.NextConn(time.Second)
+	dstTwo, err := ln.NextConn(time.Second)
 	assertNil(t, err)
 
 	// Test the function of the first connection.
-	assertWrite(t, src_one, []byte("ping again"))
-	assertRead(t, []byte("ping again"), dst_one)
+	assertWrite(t, srcOne, []byte("ping again"))
+	assertRead(t, []byte("ping again"), dstOne)
 
 	// Test the second connection.
-	assertWrite(t, src_two, []byte("ping on new conn"))
-	assertRead(t, []byte("ping on new conn"), dst_two)
+	assertWrite(t, srcTwo, []byte("ping on new conn"))
+	assertRead(t, []byte("ping on new conn"), dstTwo)
 
 	// Close the connection from the upstream side to test the downstream side is closed.
-	dst_two.Close()
-	assertClosed(t, src_two)
+	dstTwo.Close()
+	assertClosed(t, srcTwo)
 	// Close the connection from the downstream side to test the upstream side is closed.
-	src_one.Close()
-	assertClosed(t, dst_one)
+	srcOne.Close()
+	assertClosed(t, dstOne)
 
 	assertEqual(t, 0, ln.UnhandledConns())
 
@@ -227,30 +227,30 @@ func TestConnectionResume(t *testing.T) {
 	}
 
 	// Establish a connection from the downstream to the upstream.
-	src_one, err := client.Dial(context.Background())
+	srcOne, err := client.Dial(context.Background())
 	assertNil(t, err)
 	// Retrieve the corresponding upstream connection.
-	dst_one, err := ln.NextConn(time.Second)
+	dstOne, err := ln.NextConn(time.Second)
 	assertNil(t, err)
 
 	// Test both directions of the connection.
-	assertWrite(t, src_one, []byte("ping"))
-	assertRead(t, []byte("ping"), dst_one)
-	assertWrite(t, dst_one, []byte("pong"))
-	assertRead(t, []byte("pong"), src_one)
+	assertWrite(t, srcOne, []byte("ping"))
+	assertRead(t, []byte("ping"), dstOne)
+	assertWrite(t, dstOne, []byte("pong"))
+	assertRead(t, []byte("pong"), srcOne)
 
 	// Interrupt the underlying connection
 	underlyingConn.Close()
 
 	// Test both directions of the connection again to make sure that it has resumed.
-	assertWrite(t, src_one, []byte("ping2"))
-	assertRead(t, []byte("ping2"), dst_one)
-	assertWrite(t, dst_one, []byte("pong2"))
-	assertRead(t, []byte("pong2"), src_one)
+	assertWrite(t, srcOne, []byte("ping2"))
+	assertRead(t, []byte("ping2"), dstOne)
+	assertWrite(t, dstOne, []byte("pong2"))
+	assertRead(t, []byte("pong2"), srcOne)
 
 	// Close one side of the connection.
-	src_one.Close()
-	assertClosed(t, dst_one)
+	srcOne.Close()
+	assertClosed(t, dstOne)
 
 	assertEqual(t, 0, ln.UnhandledConns())
 

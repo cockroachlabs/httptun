@@ -1,3 +1,4 @@
+// Package httptun implements the client and server for the TCP over HTTP tunnel.
 package httptun
 
 import (
@@ -23,6 +24,7 @@ const (
 	defaultByteBufferSize = 65535
 )
 
+// Server implements http.Handler for the server (termination point) of a TCP over HTTP tunnel.
 type Server struct {
 	dst      string
 	upgrader *websocket.Upgrader
@@ -38,6 +40,7 @@ type Server struct {
 // ErrorCode represents an error code in a handshake.
 type ErrorCode int64
 
+// List of error codes.
 const (
 	CodeNoError = ErrorCode(iota)
 	CodeSessionNotFound
@@ -63,7 +66,6 @@ func (s *Server) janitor(timeout time.Duration) {
 		case <-s.done:
 			return
 		case <-t.C:
-			break
 		}
 
 		s.mu.Lock()

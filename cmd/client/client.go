@@ -20,14 +20,11 @@ func main() {
 		panic(err)
 	}
 
-	client := httptun.NewClient(ctx, func(ctx context.Context) (*websocket.Conn, error) {
-		conn, _, err := websocket.DefaultDialer.Dial("ws://localhost:4600/ws", nil)
-		return conn, err
-	}, 3, logger.Sugar())
-
-	err = client.Connect(ctx)
-	if err != nil {
-		panic(err)
+	client := &httptun.Client{
+		Dialer:         websocket.DefaultDialer,
+		Addr:           "ws://localhost:4600/ws",
+		RequestHeaders: nil,
+		Logger:         logger.Sugar(),
 	}
 
 	listener, err := net.Listen("tcp", "localhost:4601")
