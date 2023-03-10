@@ -120,9 +120,7 @@ func (c *Client) Dial(ctx context.Context) (net.Conn, error) {
 					}
 				}
 
-				err = flow.Resume(wsConn, handshake.ResumeFrom)
-
-				return nil
+				return flow.Resume(wsConn, handshake.ResumeFrom)
 			}()
 			if err != nil {
 				c.Logger.Errorf("failed to handshake: %+v\n", err)

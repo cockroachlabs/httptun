@@ -1,3 +1,4 @@
+// Package httptun implements the client and server for the TCP over HTTP tunnel.
 package httptun
 
 import (
@@ -23,8 +24,7 @@ const (
 	defaultByteBufferSize = 65535
 )
 
-// Server is a server that can be used to serve HTTP requests over a websocket connection.
-// It overrides the default http.Server to use a websocket connection instead of a plain TCP connection.
+// Server implements http.Handler for the server (termination point) of a TCP over HTTP tunnel.
 type Server struct {
 	dst      string
 	upgrader *websocket.Upgrader
@@ -66,7 +66,6 @@ func (s *Server) janitor(timeout time.Duration) {
 		case <-s.done:
 			return
 		case <-t.C:
-			break
 		}
 
 		s.mu.Lock()
