@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/cockroachlabs/httptun"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 )
 
@@ -21,6 +22,16 @@ func main() {
 
 	if dstAddr == "" {
 		panic("HTTPTUN_DST_ADDR is not set")
+	}
+
+	// Default to 1 minute timeout.
+	timeout := time.Minute
+	if t := os.Getenv("HTTPTUN_JANITOR_TIMEOUT"); t != "" {
+		var err error
+		timeout, err = time.ParseDuration(t)
+		if err != nil {
+			panic(err)
+		}
 	}
 
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -41,8 +52,13 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	if enableDebug {
+		logger.Debug("verbose logging enabled")
+	}
 
-	http.Handle("/ws", httptun.NewServer(dstAddr, time.Minute, logger.Sugar()))
+	http.Handle("/ws", httptun.NewServer(dstAddr, timeout, logger.Sugar()))
+
+	http.Handle("/metrics", promhttp.Handler())
 
 	log.Fatalln(http.ListenAndServe(listenAddr, nil))
 }
