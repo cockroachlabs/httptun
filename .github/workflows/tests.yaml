@@ -37,6 +37,8 @@ jobs:
           key: ${{ runner.os }}-quality-${{ hashFiles('**/go.sum') }}
 
       # This action should, in general, be a no-op, given the cache above.
+      # We also fetch dependencies needed for linting and static analysis, these are not managed in go.mod
+      # because `go mod tidy` would remove them, making dependency management more complicated.
       - name: Download all deps
         run: go mod download
 

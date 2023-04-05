@@ -6,14 +6,17 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/errors"
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap/zaptest"
+	"golang.org/x/net/nettest"
 )
 
 func TestTunnel(t *testing.T) {
@@ -41,9 +44,11 @@ func TestTunnel(t *testing.T) {
 	// Establish a connection from the downstream to the upstream.
 	srcOne, err := client.Dial(context.Background())
 	assertNil(t, err)
+	defer srcOne.Close()
 	// Retrieve the corresponding upstream connection.
 	dstOne, err := ln.NextConn(time.Second)
 	assertNil(t, err)
+	defer dstOne.Close()
 
 	// Test both directions of the connection.
 	assertWrite(t, srcOne, []byte("ping"))
@@ -54,8 +59,10 @@ func TestTunnel(t *testing.T) {
 	// Establish another connection.
 	srcTwo, err := client.Dial(context.Background())
 	assertNil(t, err)
+	defer srcTwo.Close()
 	dstTwo, err := ln.NextConn(time.Second)
 	assertNil(t, err)
+	defer dstTwo.Close()
 
 	// Test the function of the first connection.
 	assertWrite(t, srcOne, []byte("ping again"))
@@ -123,6 +130,7 @@ type listener struct {
 	t      *testing.T
 	ln     net.Listener
 	conns  chan net.Conn
+	done   chan struct{}
 }
 
 // listen starts a TCP server at an arbitrary port on localhost.
@@ -133,10 +141,13 @@ func listen(t *testing.T) *listener {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
+	done := make(chan struct{})
+
 	// In the current tests, we only expect one connection at a time to sit in this buffer.
 	conns := make(chan net.Conn, 5)
 	var i int64
 	go func() {
+		defer close(done)
 		for {
 			i := atomic.AddInt64(&i, 1)
 			conn, err := ln.Accept()
@@ -164,6 +175,7 @@ func listen(t *testing.T) *listener {
 		cancel: cancel,
 		conns:  conns,
 		ln:     ln,
+		done:   done,
 	}
 }
 
@@ -186,11 +198,60 @@ func (l *listener) Close() error {
 		return err
 	}
 	close(l.conns)
+	<-l.done
 	return nil
 }
 
 func (l *listener) Addr() string {
 	return l.ln.Addr().String()
+}
+
+func TestFailedDial(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	// Test a failed TCP dial.
+	dialer := &websocket.Dialer{
+		NetDialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return nil, errors.New("test dial error")
+		},
+	}
+
+	client := &Client{
+		Dialer: dialer,
+		Addr:   "ws://testaddr/ws",
+		Logger: zaptest.NewLogger(t).Sugar().Named("client"),
+	}
+
+	_, err := client.Dial(ctx)
+	if err == nil {
+		t.Fatalf("want error, got nil")
+	}
+
+	// Test a failed websocket handshake.
+	ln, err := nettest.NewLocalListener("tcp")
+	assertNil(t, err)
+
+	server := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+		}),
+	}
+
+	defer server.Close()
+
+	go server.Serve(ln)
+
+	client = &Client{
+		Dialer: websocket.DefaultDialer,
+		Addr:   fmt.Sprintf("ws://%s/ws", ln.Addr()),
+		Logger: zaptest.NewLogger(t).Sugar().Named("client"),
+	}
+
+	_, err = client.Dial(ctx)
+	if err == nil {
+		t.Fatalf("want error, got nil")
+	}
 }
 
 func TestConnectionResume(t *testing.T) {
@@ -229,9 +290,11 @@ func TestConnectionResume(t *testing.T) {
 	// Establish a connection from the downstream to the upstream.
 	srcOne, err := client.Dial(context.Background())
 	assertNil(t, err)
+	defer srcOne.Close()
 	// Retrieve the corresponding upstream connection.
 	dstOne, err := ln.NextConn(time.Second)
 	assertNil(t, err)
+	defer dstOne.Close()
 
 	// Test both directions of the connection.
 	assertWrite(t, srcOne, []byte("ping"))
@@ -249,6 +312,120 @@ func TestConnectionResume(t *testing.T) {
 	assertRead(t, []byte("pong2"), srcOne)
 
 	// Close one side of the connection.
+	srcOne.Close()
+	assertClosed(t, dstOne)
+
+	assertEqual(t, 0, ln.UnhandledConns())
+
+	assertNil(t, ln.Close())
+}
+
+type pausableConnection struct {
+	net.Conn
+	paused atomic.Bool
+}
+
+func (c *pausableConnection) Read(b []byte) (int, error) {
+	for c.paused.Load() {
+		time.Sleep(time.Millisecond * 10)
+	}
+	return c.Conn.Read(b)
+}
+
+func (c *pausableConnection) Write(b []byte) (int, error) {
+	for c.paused.Load() {
+		time.Sleep(time.Millisecond * 10)
+	}
+	return c.Conn.Write(b)
+}
+
+func (c *pausableConnection) Close() error {
+	defer c.paused.Store(false)
+	return c.Conn.Close()
+}
+
+func TestKeepAlive(t *testing.T) {
+	// Set up a network like this:
+	//
+	// upstream   tunnel server   tunnel client
+	//    TCP <---> TCP....WS <---> WS
+
+	ln := listen(t)
+
+	server := NewServer(ln.Addr(), time.Second, zaptest.NewLogger(t).Sugar().Named("server"))
+	defer server.Close()
+	httpServer := httptest.NewServer(server)
+
+	u, err := url.Parse(httpServer.URL)
+	assertNil(t, err)
+	u.Scheme = "ws"
+
+	var underlyingConn atomic.Pointer[pausableConnection]
+
+	dialer := &websocket.Dialer{
+		NetDialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			var netDialer net.Dialer
+			var err error
+			rawConn, err := netDialer.DialContext(ctx, network, addr)
+
+			conn := &pausableConnection{
+				Conn: rawConn,
+			}
+
+			underlyingConn.Store(conn)
+			return conn, err
+		},
+	}
+
+	client := &Client{
+		Dialer:    dialer,
+		Addr:      u.String(),
+		Logger:    zaptest.NewLogger(t).Sugar().Named("client"),
+		KeepAlive: time.Millisecond * 100,
+	}
+
+	// Establish a connection from the downstream to the upstream.
+	srcOne, err := client.Dial(context.Background())
+	assertNil(t, err)
+	defer srcOne.Close()
+	// Retrieve the corresponding upstream connection.
+	dstOne, err := ln.NextConn(time.Second)
+	assertNil(t, err)
+	defer dstOne.Close()
+
+	// Test both directions of the connection.
+	assertWrite(t, srcOne, []byte("ping"))
+	assertRead(t, []byte("ping"), dstOne)
+
+	// Expect no interruption after 5 * KeepAlive.
+	time.Sleep(500 * time.Millisecond)
+
+	assertWrite(t, dstOne, []byte("pong"))
+	assertRead(t, []byte("pong"), srcOne)
+
+	// Interrupt the underlying connection by pausing it, which should cause the keepalive to fail.
+	originalUnderlying := underlyingConn.Load()
+	originalUnderlying.paused.Store(true)
+
+	pauseTime := time.Now()
+
+	// Test both directions of the connection again to make sure that it has resumed.
+	assertWrite(t, srcOne, []byte("ping2"))
+	assertRead(t, []byte("ping2"), dstOne)
+
+	resumeDuration := time.Since(pauseTime)
+	if resumeDuration < 100*time.Millisecond || resumeDuration > 350*time.Millisecond {
+		t.Fatalf("expected resume to take 100-350ms, took %v", resumeDuration)
+	}
+
+	assertWrite(t, dstOne, []byte("pong2"))
+	assertRead(t, []byte("pong2"), srcOne)
+
+	newUnderlying := underlyingConn.Load()
+	if newUnderlying == originalUnderlying {
+		t.Fatalf("expected underlying connection to change")
+	}
+
 	srcOne.Close()
 	assertClosed(t, dstOne)
 

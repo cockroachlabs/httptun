@@ -55,7 +55,7 @@ type Handshake struct {
 	ErrorCode  ErrorCode
 }
 
-// janitor is a goroutine that periodically closes idle streams whose lastActivity was more than timeout ago.
+// janitor is a goroutine that periodically closes idle streams whose lastFlowTime was more than timeout ago.
 func (s *Server) janitor(timeout time.Duration) {
 	t := time.NewTicker(timeout)
 	defer close(s.janitorDone)
@@ -75,10 +75,14 @@ func (s *Server) janitor(timeout time.Duration) {
 		}
 
 		for id, stream := range s.streams {
-			if time.Since(stream.lastActivity) > timeout {
-				stream.Close()
+			stream.cond.L.Lock()
+			lastFlowTime := stream.lastFlowTime
+			stream.cond.L.Unlock()
+			if !lastFlowTime.IsZero() && time.Since(lastFlowTime) > timeout {
+				stream.closeInternal()
 				delete(s.streams, id)
 			}
+
 		}
 		s.mu.Unlock()
 	}
@@ -133,7 +137,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	downstream := NewWebsocketConn(conn)
+	downstream := NewWebsocketConn(conn, new(sync.Mutex), func() {})
 	defer downstream.Close()
 
 	// Read the handshake from the client.
@@ -155,6 +159,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.logger.Warnf("error resuming flow: %+v", err)
 		return
 	}
+
+	flow.Wait()
 }
 
 // handleHandshake handles the handshake message from the client and responds to it as appropriate.
@@ -267,7 +273,7 @@ func (s *Server) handleHandshake(remoteAddr string, downstream net.Conn, receive
 	// Copy the data from the stream to the destination server and vice versa. These goroutines are long-lived for the
 	// lifetime of the stream.
 	go func() {
-		defer stream.Close()
+		defer stream.closeInternal()
 		defer upstream.Close()
 		_, err = io.Copy(stream, upstream)
 		if err != nil {
@@ -276,7 +282,7 @@ func (s *Server) handleHandshake(remoteAddr string, downstream net.Conn, receive
 	}()
 
 	go func() {
-		defer stream.Close()
+		defer stream.closeInternal()
 		defer upstream.Close()
 		_, err = io.Copy(upstream, stream)
 		if err != nil {

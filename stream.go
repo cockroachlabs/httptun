@@ -17,11 +17,14 @@ type Stream struct {
 	readBuffer  []byte
 	writeBuffer *Buffer
 
-	wg           *sync.WaitGroup
-	lastActivity time.Time
+	wg   *sync.WaitGroup
+	wgMu *sync.Mutex
 
-	flowID uuid.UUID
-	cond   *sync.Cond
+	lastFlowTime time.Time
+
+	flowID    uuid.UUID
+	cond      *sync.Cond
+	closeOnce sync.Once
 
 	logger *zap.SugaredLogger
 	err    error
@@ -33,9 +36,10 @@ func NewStream(maxTotal, minBehind int64, logger *zap.SugaredLogger) *Stream {
 	return &Stream{
 		writeBuffer:  NewBuffer(maxTotal, minBehind, logger),
 		wg:           new(sync.WaitGroup),
+		wgMu:         new(sync.Mutex),
 		cond:         sync.NewCond(new(sync.Mutex)),
 		logger:       logger,
-		lastActivity: time.Now(),
+		lastFlowTime: time.Now(),
 	}
 }
 
@@ -60,7 +64,7 @@ func (s *Stream) NewFlow() (*Flow, int64, error) {
 
 	resumeFrom := s.bytesRead + int64(len(s.readBuffer))
 	s.flowID = flowID
-	s.lastActivity = time.Now()
+	s.lastFlowTime = time.Now()
 
 	s.cond.L.Unlock()
 	s.cond.Broadcast()
@@ -123,14 +127,28 @@ func (s *Stream) Write(p []byte) (n int, err error) {
 // Close closes the stream, immediately preempting all Read, Write calls and flows. It is safe to call Close multiple
 // times.
 func (s *Stream) Close() error {
-	s.logger.Debugf("closing stream %p", s)
-	s.cond.L.Lock()
-	s.err = io.EOF
-	s.cond.L.Unlock()
-	s.cond.Broadcast()
-	s.writeBuffer.Close()
-	streamsCount.Dec()
+	// Signal that all the goroutines in the stream should stop.
+	s.closeInternal()
+	s.logger.Debugf("closing stream")
+	// Wait for stream goroutines to finish.
+	s.wgMu.Lock()
+	s.wg.Wait()
+	s.wgMu.Unlock()
 	return nil
+}
+
+// closeInternal is the internal implementation of Close that is asynchronous and does not wait for all goroutines
+// to finish. It is used by the goroutines that are being waited on in `s.wg` hence the need for a separate method
+// to prevent a deadlock.
+func (s *Stream) closeInternal() {
+	s.closeOnce.Do(func() {
+		s.cond.L.Lock()
+		s.err = io.EOF
+		s.cond.L.Unlock()
+		s.cond.Broadcast()
+		s.writeBuffer.Close()
+		streamsCount.Dec()
+	})
 }
 
 // IsClosed returns true if the stream is closed.
@@ -142,30 +160,44 @@ func (s *Stream) IsClosed() bool {
 }
 
 // Resume attempts to resume the flow's stream with the given "unreliable" connection (typically a WebSocket
-// connection) and resumeFrom value from the handshake. Resume will automatically close the unreliable connection
-// when complete.
+// connection) and resumeFrom value from the handshake. Once the flow is successfully resumed, Resume returns.
+// Call Wait to wait for the flow to finish. unreliable is automatically closed.
 func (f *Flow) Resume(unreliable net.Conn, resumeFrom int64) error {
-	defer unreliable.Close()
-	defer func() {
-		f.logger.Debugf("closing connection in flow %q, stream: %p", f.id, f.Stream)
-	}()
-
 	f.logger.Debugf("resuming flow from %d", resumeFrom)
 
 	reader := f.writeBuffer.TakeReader(f.id)
 
 	err := reader.SetReaderPos(resumeFrom)
 	if err != nil {
+		unreliable.Close()
 		return errors.Newf("cannot resume flow from position %v, please increase minBehindBuffer", resumeFrom)
 	}
+
+	f.wgMu.Lock()
+	defer f.wgMu.Unlock()
 
 	f.wg.Add(1)
 	// read from client
 	go func() {
-		defer f.wg.Done()
-		defer unreliable.Close()
-		// We call TakeReader to preempt the buffer to make any in-flight read calls return immediately.
-		defer f.writeBuffer.TakeReader(uuid.Nil)
+		defer func() {
+			f.logger.Debugf("quitting flow reader %q", f.id.String())
+			// We call TakeReader to preempt the buffer to make any in-flight read calls return immediately.
+			f.writeBuffer.TakeReader(uuid.Nil)
+			unreliable.Close()
+			f.wg.Done()
+		}()
+
+		f.cond.L.Lock()
+		// Mark last activity as the zero value, which the janitor recognizes as the flow being active.
+		f.lastFlowTime = time.Time{}
+		f.cond.L.Unlock()
+
+		defer func() {
+			f.cond.L.Lock()
+			// Mark the last activity when the flow ends.
+			f.lastFlowTime = time.Now()
+			f.cond.L.Unlock()
+		}()
 
 		buf := make([]byte, defaultByteBufferSize)
 
@@ -202,15 +234,18 @@ func (f *Flow) Resume(unreliable net.Conn, resumeFrom int64) error {
 	f.wg.Add(1)
 	// write to client
 	go func() {
-		defer f.wg.Done()
-		defer unreliable.Close()
-		// We call TakeReader to preempt the buffer to make any in-flight read calls return immediately.
-		defer f.writeBuffer.TakeReader(uuid.Nil)
+		defer func() {
+			f.logger.Debugf("quitting flow writer %q", f.id.String())
+			// We call TakeReader to preempt the buffer to make any in-flight read calls return immediately.
+			f.writeBuffer.TakeReader(uuid.Nil)
+			unreliable.Close()
+			f.wg.Done()
+		}()
 
 		buf := make([]byte, defaultByteBufferSize)
 
 		for {
-			// reader will automatically preempt with an error, so we don't need to do the f.IsValid checking.\
+			// reader will automatically preempt with an error, so we don't need to do the f.IsValid checking.
 			n, err := reader.Read(buf)
 			if err != nil {
 				f.logger.Infof("error reading from buffer: %v", err)
@@ -233,9 +268,16 @@ func (f *Flow) Resume(unreliable net.Conn, resumeFrom int64) error {
 		}
 	}()
 
-	f.wg.Wait()
-
 	return nil
+}
+
+// Wait waits for the flow to end, you would typically call this after a successful call to Resume.
+func (f *Flow) Wait() {
+	f.wgMu.Lock()
+	f.logger.Debugf("waiting for flow inside mutex %q", f.id.String())
+	f.wg.Wait()
+	f.logger.Debugf("flow wait finished %q", f.id.String())
+	f.wgMu.Unlock()
 }
 
 type streamAddr struct {

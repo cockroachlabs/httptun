@@ -3,8 +3,11 @@ package httptun
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"net"
 	"net/http"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -12,6 +15,8 @@ import (
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
 )
+
+const defaultKeepAlive = 5 * time.Second
 
 // Client opens Websocket connections, returning them as a [net.Conn].
 // A zero Client is ready for use without initialization.
@@ -21,6 +26,9 @@ type Client struct {
 	Addr           string
 	RequestHeaders func() http.Header
 	Logger         *zap.SugaredLogger
+	// KeepAlive sets the interval and timeout (2*KeepAlive) of WebSocket keep alive messages.
+	// If unset, defaults to 5 seconds.
+	KeepAlive time.Duration
 }
 
 func (c *Client) dialWebsocket(ctx context.Context) (net.Conn, error) {
@@ -45,8 +53,79 @@ func (c *Client) dialWebsocket(ctx context.Context) (net.Conn, error) {
 		}
 	}
 
-	return NewWebsocketConn(ws), nil
+	writeMu := new(sync.Mutex)
+	var lastRespPtr atomic.Pointer[time.Time]
+	now := time.Now()
+	lastRespPtr.Store(&now)
+	keepAliveStopped := make(chan struct{})
+	stopKeepAlive := make(chan struct{})
+
+	c.Logger.Debugf("constructed keep alive: %p", &stopKeepAlive)
+
+	ws.SetPongHandler(func(string) error {
+		c.Logger.Debugf("received keep alive pong")
+		now := time.Now()
+		lastRespPtr.Store(&now)
+		return nil
+	})
+
+	go func() {
+		logger := c.Logger.With("ws", fmt.Sprintf("%p", ws))
+		logger.Debugf("starting keep alive")
+		defer close(keepAliveStopped)
+
+		keepAlive := c.KeepAlive
+
+		if keepAlive == 0 {
+			keepAlive = defaultKeepAlive
+		}
+
+		t := time.NewTicker(keepAlive)
+
+		var writeFailure atomic.Bool
+
+		defer t.Stop()
+		defer ws.Close()
+
+		for {
+			logger.Debugf("waiting on keep alive: %p", &stopKeepAlive)
+			select {
+			case <-stopKeepAlive:
+				logger.Debugf("keep alive stopping")
+				return
+			case <-t.C:
+			}
+			if writeFailure.Load() {
+				return
+			}
+
+			lastResp := lastRespPtr.Load()
+			if time.Since(*lastResp) > 2*c.KeepAlive {
+				logger.Warnf("keep alive timeout, closing websocket connection")
+				return
+			}
+
+			logger.Debugf("sending keep alive")
+			go func() {
+				writeMu.Lock()
+				defer writeMu.Unlock()
+				err := ws.WriteMessage(websocket.PingMessage, []byte("ka"))
+				if err != nil {
+					writeFailure.Store(true)
+				}
+			}()
+		}
+	}()
+
+	return NewWebsocketConn(ws, writeMu, func() {
+		// Signal to stop keep alives.
+		close(stopKeepAlive)
+		// Wait until keep alives are stopped.
+		<-keepAliveStopped
+	}), nil
 }
+
+var errWebsocketDial = errors.New("websocket dial error")
 
 // Dial forms a tunnel to the backend TCP endpoint and returns a net.Conn.
 //
@@ -54,7 +133,7 @@ func (c *Client) dialWebsocket(ctx context.Context) (net.Conn, error) {
 func (c *Client) Dial(ctx context.Context) (net.Conn, error) {
 	connectionResult := make(chan error, 1)
 
-	established := false
+	firstAttempt := true
 	stream := NewStream(maxBufferSize, minBufferBehindSize, c.Logger)
 
 	go func() {
@@ -64,28 +143,20 @@ func (c *Client) Dial(ctx context.Context) (net.Conn, error) {
 			var wsConn net.Conn
 			var err error
 
-			c.Logger.Debug("dialing websocket")
-			if established {
-				wsConn, err = c.dialWebsocket(context.Background())
-			} else {
-				wsConn, err = c.dialWebsocket(ctx)
-			}
-
-			if err != nil {
-				c.Logger.Errorw("failed to dial connection", "err", err)
-				time.Sleep(100 * time.Millisecond)
-
-				continue
-			}
-
-			c.Logger.Debug("websocket successfully dialed")
-
-			err = func() error {
-				defer wsConn.Close()
+			waitFlowFinish, err := func() (func(), error) {
+				c.Logger.Debug("dialing websocket")
+				if firstAttempt {
+					wsConn, err = c.dialWebsocket(ctx)
+				} else {
+					wsConn, err = c.dialWebsocket(context.Background())
+				}
+				if err != nil {
+					return nil, errors.Mark(err, errWebsocketDial)
+				}
 
 				flow, resumeFrom, err := stream.NewFlow()
 				if err != nil {
-					return errors.WithMessage(err, "create flow")
+					return nil, errors.WithMessage(err, "create flow")
 				}
 
 				err = binary.Write(wsConn, binary.LittleEndian, Handshake{
@@ -93,48 +164,58 @@ func (c *Client) Dial(ctx context.Context) (net.Conn, error) {
 					ResumeFrom: resumeFrom,
 				})
 				if err != nil {
-					return errors.WithMessage(err, "write handshake")
+					return nil, errors.WithMessage(err, "write handshake")
 				}
 
 				var handshake Handshake
 				err = binary.Read(wsConn, binary.LittleEndian, &handshake)
 				if err != nil {
-					return errors.WithMessage(err, "read handshake")
+					return nil, errors.WithMessage(err, "read handshake")
 				}
 
 				if handshake.ErrorCode != 0 {
 					if handshake.ErrorCode == CodeCannotResume || handshake.ErrorCode == CodeSessionNotFound {
 						// Stream is not resumable with these errors.
-						stream.Close()
+						stream.closeInternal()
 					}
-					return errors.Newf("handshake error code: %d", handshake.ErrorCode)
+					return nil, errors.Newf("handshake error code: %d", handshake.ErrorCode)
 				}
 
 				streamID = handshake.ID
 
-				if !established {
-					established = true
-					select {
-					case connectionResult <- nil:
-					default:
-					}
+				err = flow.Resume(wsConn, handshake.ResumeFrom)
+				if err != nil {
+					return nil, errors.WithMessage(err, "resume flow")
 				}
 
-				return flow.Resume(wsConn, handshake.ResumeFrom)
+				return flow.Wait, nil
 			}()
 			if err != nil {
 				c.Logger.Errorf("failed to handshake: %+v\n", err)
 
-				if !established {
-					select {
-					case connectionResult <- err:
-					default:
-					}
+				if !errors.Is(err, errWebsocketDial) {
+					wsConn.Close()
+				}
+
+				if firstAttempt {
+					connectionResult <- err
+					return
 				}
 
 				time.Sleep(100 * time.Millisecond)
 				continue
+			} else {
+				if firstAttempt {
+					connectionResult <- nil
+				}
+
+				c.Logger.Debugf("flow established")
+				waitFlowFinish()
 			}
+
+			c.Logger.Debugf("flow finished, reconnecting (firstAttempt=%v)", firstAttempt)
+
+			firstAttempt = false
 		}
 	}()
 

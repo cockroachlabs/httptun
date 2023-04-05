@@ -2,6 +2,7 @@ package httptun
 
 import (
 	"net"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -9,14 +10,19 @@ import (
 
 // WebsocketConn wraps *websocket.Conn into implementing net.Conn
 type WebsocketConn struct {
-	buf  []byte
-	conn *websocket.Conn
+	buf       []byte
+	conn      *websocket.Conn
+	writeMu   *sync.Mutex
+	waitClose func()
+	closeOnce sync.Once
 }
 
 // NewWebsocketConn creates a new WebsocketConn from an open websocket connection which implements net.Conn
-func NewWebsocketConn(conn *websocket.Conn) *WebsocketConn {
+func NewWebsocketConn(conn *websocket.Conn, writeMu *sync.Mutex, waitClose func()) *WebsocketConn {
 	return &WebsocketConn{
-		conn: conn,
+		conn:      conn,
+		writeMu:   writeMu,
+		waitClose: waitClose,
 	}
 }
 
@@ -46,6 +52,9 @@ func (c *WebsocketConn) Read(b []byte) (int, error) {
 
 // Write implements net.Conn
 func (c *WebsocketConn) Write(b []byte) (int, error) {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+
 	err := c.conn.WriteMessage(websocket.BinaryMessage, b)
 	if err != nil {
 		return 0, err
@@ -56,7 +65,10 @@ func (c *WebsocketConn) Write(b []byte) (int, error) {
 
 // Close implements net.Conn
 func (c *WebsocketConn) Close() error {
-	return c.conn.Close()
+	err := c.conn.Close()
+	// Wait for connection clean up (i.e. keep alive goroutine) to finish.
+	c.closeOnce.Do(c.waitClose)
+	return err
 }
 
 // LocalAddr implements net.Conn
