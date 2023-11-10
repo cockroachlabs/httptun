@@ -69,6 +69,8 @@ type Buffer struct {
 	hasActiveReader bool
 	flowID          uuid.UUID
 	logger          *zap.SugaredLogger
+
+	bytesWritten int64
 }
 
 // NewBuffer constructs a new buffer with the given size and logger. See Buffer for more information.
@@ -204,6 +206,7 @@ func (b *Buffer) Write(p []byte) (n int, err error) {
 	}
 
 	b.buffer = append(b.buffer, p[:availableCapacity]...)
+	b.bytesWritten += availableCapacity
 
 	b.cond.Broadcast()
 

@@ -40,14 +40,18 @@ type Stream struct {
 	cond      *sync.Cond
 	closeOnce sync.Once
 
-	logger *zap.SugaredLogger
-	err    error
+	logger    *zap.SugaredLogger
+	err       error
+	startTime time.Time
+
+	onClose func(startTime time.Time, bytesRead, bytesWritten int64)
 }
 
 // NewStream creates a new stream.
 func NewStream(maxTotal, minBehind int64, logger *zap.SugaredLogger) *Stream {
 	streamsCount.Inc()
 	return &Stream{
+		startTime:    time.Now(),
 		writeBuffer:  NewBuffer(maxTotal, minBehind, logger),
 		wg:           new(sync.WaitGroup),
 		wgMu:         new(sync.Mutex),
@@ -55,6 +59,12 @@ func NewStream(maxTotal, minBehind int64, logger *zap.SugaredLogger) *Stream {
 		logger:       logger,
 		lastFlowTime: time.Now(),
 	}
+}
+
+// OnClose sets a callback function that is called when a stream closes. It provides the start
+// time of the connection, and the total number of bytes read from and written to the stream.
+func (s *Stream) OnClose(f func(startTime time.Time, bytesRead, bytesWritten int64)) {
+	s.onClose = f
 }
 
 // Flow is an active "instance" of a stream, which represents an unreliable connection such as a WebSocket
@@ -158,10 +168,17 @@ func (s *Stream) closeInternal() {
 	s.closeOnce.Do(func() {
 		s.cond.L.Lock()
 		s.err = io.EOF
+		startTime := s.startTime
+		bytesRead := s.bytesRead
+		bytesWritten := s.writeBuffer.bytesWritten
 		s.cond.L.Unlock()
 		s.cond.Broadcast()
 		s.writeBuffer.Close()
 		streamsCount.Dec()
+
+		if s.onClose != nil {
+			s.onClose(startTime, bytesRead, bytesWritten)
+		}
 	})
 }
 

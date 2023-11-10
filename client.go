@@ -114,7 +114,7 @@ func (c *Client) dialWebsocket(ctx context.Context) (net.Conn, error) {
 			}
 
 			lastResp := lastRespPtr.Load()
-			if time.Since(*lastResp) > 2*c.KeepAlive {
+			if time.Since(*lastResp) > 2*keepAlive {
 				logger.Warnf("keep alive timeout, closing websocket connection")
 				return
 			}
@@ -141,6 +141,26 @@ func (c *Client) dialWebsocket(ctx context.Context) (net.Conn, error) {
 
 var errWebsocketDial = errors.New("websocket dial error")
 
+// dialedConn is a wrapper around net.Conn that correctly performs Close signaling for the websocket manager
+// in the Dial method.
+type dialedConn struct {
+	net.Conn
+	closed chan struct{}
+}
+
+// Close implements Close in net.Conn.
+func (d *dialedConn) Close() error {
+	err := d.Conn.Close()
+	if err != nil {
+		// We return early if the connection fails to close. Although this should never happen, this might leak a
+		// goroutine, but it's better than something going wrong and this goroutine stalling.
+		return err
+	}
+
+	<-d.closed
+	return nil
+}
+
 // Dial forms a tunnel to the backend TCP endpoint and returns a net.Conn.
 //
 // Callers are responsible for closing the returned connection.
@@ -149,8 +169,14 @@ func (c *Client) Dial(ctx context.Context) (net.Conn, error) {
 
 	firstAttempt := true
 	stream := NewStream(maxBufferSize, minBufferBehindSize, c.Logger)
+	conn := &dialedConn{
+		Conn:   stream,
+		closed: make(chan struct{}),
+	}
 
 	go func() {
+		defer close(conn.closed)
+
 		var streamID uuid.UUID
 
 		for !stream.IsClosed() {
@@ -239,5 +265,5 @@ func (c *Client) Dial(ctx context.Context) (net.Conn, error) {
 		return nil, err
 	}
 
-	return stream, nil
+	return conn, nil
 }
