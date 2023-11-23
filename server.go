@@ -49,6 +49,8 @@ type Server struct {
 	isClosed    bool
 	done        chan struct{}
 	janitorDone chan struct{}
+
+	onClose func(streamID uuid.UUID, startTime time.Time, bytesRead, bytesWritten int64)
 }
 
 // ErrorCode represents an error code in a handshake.
@@ -120,6 +122,12 @@ func NewServer(dst string, timeout time.Duration, logger *zap.SugaredLogger) *Se
 	go s.janitor(timeout)
 
 	return s
+}
+
+// OnStreamClose sets a callback handler for when a stream closes. The callback should never block as it is not
+// called in a separate goroutine.
+func (s *Server) OnStreamClose(f func(streamID uuid.UUID, startTime time.Time, bytesRead, bytesWritten int64)) {
+	s.onClose = f
 }
 
 // Close shuts down the server, closing existing streams and rejects new connections.
@@ -268,6 +276,12 @@ func (s *Server) handleHandshake(remoteAddr string, downstream net.Conn, receive
 		zap.String("stream", id.String()),
 		zap.String("remote_ip", remoteAddr),
 	))
+
+	if s.onClose != nil {
+		stream.OnClose(func(startTime time.Time, bytesRead, bytesWritten int64) {
+			s.onClose(id, startTime, bytesRead, bytesWritten)
+		})
+	}
 
 	s.streams[id] = stream
 	s.mu.Unlock()

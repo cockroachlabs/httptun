@@ -10,8 +10,7 @@
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
-// limitations under the License.
-
+// limitations under the Licen
 package httptun
 
 import (
@@ -28,6 +27,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/errors"
+	"github.com/gofrs/uuid"
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap/zaptest"
 	"golang.org/x/net/nettest"
@@ -42,8 +42,22 @@ func TestTunnel(t *testing.T) {
 	// Start the upstream TCP server.
 	ln := listen(t)
 
+	type closeEvent struct {
+		bytesRead    int64
+		bytesWritten int64
+	}
+
+	closeEvents := make(chan closeEvent, 10)
+
 	// Start the tunnel server, which uses ln as its upstream.
 	srv := NewServer(ln.Addr(), time.Millisecond*200, zaptest.NewLogger(t).Sugar().Named("server"))
+	srv.OnStreamClose(func(streamID uuid.UUID, startTime time.Time, bytesRead, bytesWritten int64) {
+		closeEvents <- closeEvent{
+			bytesRead:    bytesRead,
+			bytesWritten: bytesWritten,
+		}
+	})
+
 	defer srv.Close()
 	// Make a test HTTP server with the standard library.
 	httpServer := httptest.NewServer(srv)
@@ -86,12 +100,24 @@ func TestTunnel(t *testing.T) {
 	assertWrite(t, srcTwo, []byte("ping on new conn"))
 	assertRead(t, []byte("ping on new conn"), dstTwo)
 
+	expectCloseEvent := func(bytesRead, bytesWritten int64) {
+		event := <-closeEvents
+		if event.bytesRead != bytesRead {
+			t.Fatalf("want bytes read %d, got %d", bytesRead, event.bytesRead)
+		}
+		if event.bytesWritten != bytesWritten {
+			t.Fatalf("want bytes written %d, got %d", bytesWritten, event.bytesWritten)
+		}
+	}
+
 	// Close the connection from the upstream side to test the downstream side is closed.
 	dstTwo.Close()
 	assertClosed(t, srcTwo)
+	expectCloseEvent(16, 0)
 	// Close the connection from the downstream side to test the upstream side is closed.
 	srcOne.Close()
 	assertClosed(t, dstOne)
+	expectCloseEvent(14, 4)
 
 	assertEqual(t, 0, ln.UnhandledConns())
 
